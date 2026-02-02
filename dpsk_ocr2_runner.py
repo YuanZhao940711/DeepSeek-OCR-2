@@ -14,6 +14,20 @@ import inspect
 import sys
 from pathlib import Path
 
+def remap_image_path(old_path: str, image_root: str) -> str:
+    """
+    将 jsonl 中的旧路径映射到新的 image_root 下
+    只保留文件名，避免依赖旧目录结构
+    """
+    if not old_path:
+        return old_path
+    if not image_root:
+        return old_path
+
+    fname = Path(old_path).name
+    new_path = Path(image_root) / fname
+    return str(new_path)
+
 def add_repo_to_syspath(repo_path: str) -> None:
     """
     Robustly locate deepseek_ocr.py under repo_path and add its parent dir to sys.path.
@@ -123,8 +137,12 @@ class DeepSeekOCRVLLM:
         await self.ensure_engine()
 
         from PIL import Image, ImageOps
-        img = Image.open(image_path)
-        img = ImageOps.exif_transpose(img).convert("RGB") 
+        try:
+            img = Image.open(image_path)
+            img = ImageOps.exif_transpose(img).convert("RGB")
+        except Exception as e:
+            raise RuntimeError(f"Failed to open image: {image_path} ({e})") from e
+
 
         processor = self.DeepseekOCRProcessor()
         image_features = None
@@ -161,7 +179,7 @@ class DeepSeekOCRVLLM:
             if request_out.outputs: 
                 full_text = request_out.outputs[0].text
                 new_text = full_text[printed_length:]
-                print(new_text, end='', flush=True)
+                # print(new_text, end='', flush=True)
                 printed_length = len(full_text)
                 final_text = full_text
         return final_text
@@ -183,7 +201,7 @@ async def run_single(ds: DeepSeekOCRVLLM, image_path: str, save_path: Optional[s
             f.write(text)
         print(f"\n[SAVED] OCR text -> {save_path}")
 
-async def run_jsonl(ds: DeepSeekOCRVLLM, input_jsonl: str, output_jsonl: str):
+async def run_jsonl(ds: DeepSeekOCRVLLM, input_jsonl: str, output_jsonl: str, image_root: str = ""):
     """
     输入：你的 test.jsonl（每行包含 images: [path]）
     输出：ocr_dump.jsonl（每行包含 image_path, ocr_text）
@@ -196,7 +214,16 @@ async def run_jsonl(ds: DeepSeekOCRVLLM, input_jsonl: str, output_jsonl: str):
             sample = json.loads(line)
             # 兼容 images 是 list[str] 或 list[dict]
             img0 = sample["images"][0]
-            image_path = img0["path"] if isinstance(img0, dict) else img0
+            # image_path = img0["path"] if isinstance(img0, dict) else img0
+
+            old_image_path = img0["path"] if isinstance(img0, dict) else img0
+            image_path = remap_image_path(old_image_path, image_root)
+
+            if not os.path.exists(image_path):
+                # row = {"image_path": image_path, "ocr_text": "", "error": "file_not_found"}
+                row = {"image_path": image_path, "old_image_path": old_image_path, "ocr_text": ocr_text}
+                fout.write(json.dumps(row, ensure_ascii=False) + "\n")
+                continue
 
             ocr_text = await ds.ocr_text(image_path)
             row = {"image_path": image_path, "ocr_text": ocr_text}
@@ -213,6 +240,12 @@ def build_args():
     parser.add_argument("--gpu_mem_util", type=float, default=0.75)
     parser.add_argument("--max_model_len", type=int, default=8192)
     parser.add_argument("--deepseek_repo", type=str, default="/data/diaoliang/zhaoyuan/models/DeepSeek-OCR", help="path to DeepSeek-OCR repo (source code)")
+    parser.add_argument(
+        "--image_root",
+        type=str,
+        default="",
+        help="override image root dir, used to remap image paths in jsonl"
+    )
 
     sub = parser.add_subparsers(dest="cmd", required=True)
 
@@ -237,7 +270,8 @@ async def main_async():
     cfg = DeepSeekOCRConfig(
         model_path=args.model_path,
         prompt=args.prompt,
-        crop_mode=bool(args.crop_mode),
+        # crop_mode=bool(args.crop_mode),
+        crop_mode = (args.crop_mode == 1),
         gpu_memory_utilization=args.gpu_mem_util,
         max_model_len=args.max_model_len,
     )
@@ -247,7 +281,7 @@ async def main_async():
     if args.cmd == "single":
         await run_single(ds, args.image, args.save_txt or None)
     elif args.cmd == "jsonl":
-        await run_jsonl(ds, args.input_jsonl, args.output_jsonl)
+        await run_jsonl(ds, args.input_jsonl, args.output_jsonl, args.image_root)
     else:
         raise ValueError(args.cmd)
 
